@@ -578,8 +578,13 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         let (inds, scores) = moeRouterTopK(
             gates, k: topK, normalize: normTopkProb)
 
-        let y = switchMLP(x, inds)
-        let combined = weightedExpertSum(y, scores)
+        let tokenCount = x.size / x.dim(-1)
+        let flatX = x.reshaped(tokenCount, x.dim(-1))
+        let flatIndices = inds.reshaped(tokenCount, topK)
+        let flatScores = scores.reshaped(tokenCount, topK)
+        let combined = switchMLP.callAndWeightedReduce(
+            flatX, flatIndices, weights: flatScores, fuseSortedReduction: true
+        ).reshaped(x.shape)
 
         var sharedY = sharedExpert(x)
         sharedY = sigmoid(sharedExpertGate(x)) * sharedY

@@ -185,6 +185,11 @@ final class Qwen35GatedDeltaNet: Module {
     @ModuleInfo(key: "in_proj_b") var inProjB: Linear
     @ModuleInfo(key: "in_proj_a") var inProjA: Linear
 
+    // Inference-only physical projection. The four registered modules remain
+    // as views so checkpoint, adapter, and parameter paths do not change.
+    private let fusedInputProjection = FusedQuantizedLinearProjectionCache()
+    var fusedInputProjectionEnabled = qwen35FourGDNEnabled
+
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
 
@@ -231,6 +236,94 @@ final class Qwen35GatedDeltaNet: Module {
         _outProj.wrappedValue = Linear(valueDim, hiddenSize, bias: false)
 
         super.init()
+    }
+
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        let inputProjectionPrefixes = [
+            "in_proj_qkv.", "in_proj_z.", "in_proj_b.", "in_proj_a.",
+        ]
+        let replacesInputProjection = parameters.flattened().contains { key, _ in
+            inputProjectionPrefixes.contains(where: key.hasPrefix)
+        }
+        defer {
+            // Parameter updates are incremental and can throw after changing an
+            // earlier tensor. Invalidate on both success and failure so a stale
+            // physical projection can never remain published.
+            if replacesInputProjection {
+                fusedInputProjection.invalidate()
+            }
+        }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    override func updateModule(key: String, _ value: Any) throws {
+        let replacesInputProjection =
+            key == "in_proj_qkv" || key == "in_proj_z"
+            || key == "in_proj_b" || key == "in_proj_a"
+        defer {
+            // This is conservative when the setter itself rejects the value,
+            // and necessary when a bulk update changed an earlier key first.
+            if replacesInputProjection {
+                fusedInputProjection.invalidate()
+            }
+        }
+        try super.updateModule(key: key, value)
+    }
+
+    var hasFusedInputProjection: Bool { fusedInputProjection.isPrepared }
+
+    /// Build one physical quantized projection while retaining the four named
+    /// module paths as storage-sharing views. This runs at most once between
+    /// parameter/module updates; failed eligibility checks are not repeated on
+    /// every token. The model loader calls this before publishing the model;
+    /// forward passes never invoke it.
+    @discardableResult
+    func prepareFusedInputProjection() throws -> Bool {
+        try fusedInputProjection.prepare(
+            enabled: fusedInputProjectionEnabled,
+            linears: [
+                inProjQKV, inProjZ, inProjB, inProjA,
+            ]
+        ) { sourceViews in
+            try update(
+                modules: ModuleChildren(values: [
+                    "in_proj_qkv": .value(sourceViews[0]),
+                    "in_proj_z": .value(sourceViews[1]),
+                    "in_proj_b": .value(sourceViews[2]),
+                    "in_proj_a": .value(sourceViews[3]),
+                ]), verify: [])
+        }
+    }
+
+    func projectInputs(_ inputs: MLXArray, batch: Int, sequence: Int) -> (
+        qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
+    ) {
+        guard fusedInputProjectionEnabled, let fusedInProj = fusedInputProjection.fused else {
+            return (
+                inProjQKV(inputs),
+                inProjZ(inputs).reshaped(batch, sequence, numVHeads, headVDim),
+                inProjB(inputs),
+                inProjA(inputs)
+            )
+        }
+
+        let projected = fusedInProj(inputs)
+        let qkvEnd = keyDim * 2 + valueDim
+        let zEnd = qkvEnd + valueDim
+        let bEnd = zEnd + numVHeads
+        let aEnd = bEnd + numVHeads
+        return (
+            projected[0..., 0..., ..<qkvEnd],
+            projected[0..., 0..., qkvEnd ..< zEnd].reshaped(
+                batch, sequence, numVHeads, headVDim),
+            projected[0..., 0..., zEnd ..< bEnd],
+            projected[0..., 0..., bEnd ..< aEnd]
+        )
     }
 
     func callAsFunction(
@@ -285,10 +378,7 @@ final class Qwen35GatedDeltaNet: Module {
         let B = x.dim(0)
         let S = x.dim(1)
 
-        var qkv = inProjQKV(x)
-        let z = inProjZ(x).reshaped(B, S, numVHeads, headVDim)
-        let b = inProjB(x)
-        let a = inProjA(x)
+        var (qkv, z, b, a) = projectInputs(x, batch: B, sequence: S)
 
         if let mask {
             qkv = MLX.where(mask[.ellipsis, .newAxis], qkv, 0)
@@ -1054,6 +1144,14 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
     }
 
+    public func prepare() throws {
+        for layer in model.layers {
+            if let linearAttn = layer.linearAttn {
+                _ = try linearAttn.prepareFusedInputProjection()
+            }
+        }
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         let hasMTPWeights = weights.keys.contains { $0.contains("mtp.") }
         let hasUnsanitizedConv1d = weights.contains { key, value in
@@ -1153,6 +1251,10 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
         try languageModel.newCache(parameters: parameters)
+    }
+
+    public func prepare() throws {
+        try languageModel.prepare()
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

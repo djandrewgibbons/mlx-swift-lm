@@ -160,9 +160,16 @@ public struct BaseConfiguration: Codable, Sendable {
                             perLayerQuantization[key.stringValue] = .skip
                         }
                     } else {
-                        // Otherwise, try to decode a specific Quantization object for this layer
-                        perLayerQuantization[key.stringValue] = .quantize(
-                            try container.decode(Quantization.self, forKey: key))
+                        do {
+                            // Scalar string modes ("tied_embedding": "fp16_passthrough")
+                            // are metadata, not layer instructions — the tensor stays unquantized.
+                            _ = try container.decode(String.self, forKey: key)
+                            perLayerQuantization[key.stringValue] = .skip
+                        } catch {
+                            // Otherwise, try to decode a specific Quantization object for this layer
+                            perLayerQuantization[key.stringValue] = .quantize(
+                                try container.decode(Quantization.self, forKey: key))
+                        }
                     }
                 }
             }
